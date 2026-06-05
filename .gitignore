@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.py[cod]
+.Python
+env/
+venv/
+.venv/
+*.egg-info/
+
+# IDE / OS
+.idea/
+.vscode/
+*.swp
+.DS_Store
+Thumbs.db
+
+# Environment
+.env
+.env.local
+
+# Logs
+*.log
+logs/
+
+# 再生成可能な最終成果物（gitkeepは残す）
+outputs/*
+!outputs/.gitkeep
+experiments/*/outputs/*
+!experiments/*/outputs/.gitkeep
+
+# 注意: data/raw（見積）・data/processed（中間CSV）・config・templates は
+# 業務の元データ/設定のため追跡対象とする（除外しない）。
+# 見積が社外秘の場合はリポジトリをプライベートにすること。
