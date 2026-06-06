@@ -49,6 +49,9 @@ THIN = Border(bottom=Side(style="thin", color="000000"))
 # 消費者負担送料の消費税率（送料は役務提供のため10%固定。税抜化に用いる）
 SHIPPING_TAX_RATE = 10
 
+# 参考上代超過フラグの許容率（現行維持価格のみ対象。差額ルールの超過は設計通りで除外）
+JODAI_TOL = 0.05
+
 # 酒類疑いキーワード（税率の自動確定を止め要確認へ回す判定。値は創作しない）
 ALCOHOL_HINTS = [
     "酒", "日本酒", "純米", "吟醸", "ワイン", "ビール", "焼酎",
@@ -90,9 +93,12 @@ COLUMNS: list[tuple[str, str, str]] = [
     ("箱代等_税抜", "econ", "derive"),
     ("仕入送料_基準地域_税抜", "econ", "derive"),
     ("売上原価_税抜", "econ", "derive"),
+    ("消費者負担送料_基準地域", "econ", "derive"),
+    ("送料差額_税抜", "econ", "derive"),
+    ("プライシング方式", "econ", "derive"),
+    ("推奨販売価格_税込", "econ", "derive"),
     ("想定販売価格_税込", "econ", "input"),
     ("想定販売価格_税抜", "econ", "derive"),
-    ("消費者負担送料_基準地域", "econ", "derive"),
     ("売上_税抜", "econ", "derive"),
     ("粗利_税抜", "econ", "derive"),
     ("粗利率", "econ", "derive"),
@@ -147,6 +153,18 @@ def round6(x: Optional[float]) -> Optional[float | int]:
         return None
     r = round(x, 6)
     return int(r) if r == int(r) else r
+
+
+def round_price(x: float) -> int:
+    """税込販売価格を10円単位に四捨五入する（小売向けの端数処理）.
+
+    Args:
+        x: 税込販売価格（端数あり）.
+
+    Returns:
+        10円単位に丸めた税込価格.
+    """
+    return int(x / 10.0 + 0.5) * 10
 
 
 def temp_to_cool(temp: Optional[str], mapping: dict[str, str]) -> Optional[str]:
@@ -276,8 +294,8 @@ def resolve_inbound_shipping(
     if not table:
         return None, f"仕入送料: {sup}の送料見積が未格納。空欄（要取得）"
     体系 = (table.get("体系") or "").strip()
+    cool = temp_to_cool(temp, temp_map)
     if 体系 == "温度帯型":
-        cool = temp_to_cool(temp, temp_map)
         for row in table["rows"]:
             if (row.get("キー種別") or "").strip() != "温度帯":
                 continue
@@ -299,7 +317,23 @@ def resolve_inbound_shipping(
             return round6(total), None
         return None, f"仕入送料: {ref_region}・{temp}に一致する行なし。空欄"
     if 体系 == "サイズ型":
-        return None, "仕入送料: サイズ型テーブル。荷姿サイズが見積に無いため自動引当不可（手動・要確認）"
+        size = (rec.get("荷姿サイズ") or "").strip()
+        if not size:
+            return None, "仕入送料: サイズ型だが荷姿サイズ未記入。自動引当不可（要確認）"
+        for row in table["rows"]:
+            if (row.get("キー種別") or "").strip() != "サイズ":
+                continue
+            if (row.get("地域") or "").strip() != ref_region:
+                continue
+            if (row.get("キー値") or "").strip() != size:
+                continue
+            base = to_float(row.get("送料_値"))
+            add = to_float(row.get("クール付加")) or 0
+            if base is None:
+                return None, f"仕入送料: テーブルに{ref_region}・{size}の値なし。空欄"
+            total = base + (add if cool == "クール" else 0)
+            return round6(total), None
+        return None, f"仕入送料: {ref_region}・サイズ{size}に一致する行なし。空欄"
     return None, "仕入送料: 送料体系不明。空欄"
 
 
@@ -381,19 +415,6 @@ def build_row(
         売上原価 = None
         flags.append("売上原価: 仕入単価/仕入送料のいずれか不足で算出不可")
 
-    # --- 想定販売価格（手入力。創作しない） ---
-    sale_in = to_float(rec.get("想定販売価格_税込"))
-    sale_excl: Optional[float] = None
-    if sale_in is not None:
-        out["variant_price_税込"] = round6(sale_in)
-        out["想定販売価格_税込"] = round6(sale_in)
-        sale_excl = to_excl(sale_in, rate)
-        out["想定販売価格_税抜"] = round6(sale_excl) if sale_excl is not None else ""
-        # 決済手数料は販管費。粗利には含めず参考表示のみ。
-        out["決済手数料_販管費"] = round6(sale_in * fee_rate)
-    else:
-        flags.append("想定販売価格: 未入力。採算は算出されません（手入力で確定）")
-
     # --- 消費者負担送料（公開ポリシー・基準地域・温度帯別。税抜化して売上へ算入） ---
     cool = temp_to_cool(temp, temp_map)
     cust_ship_excl: Optional[float] = None
@@ -403,6 +424,39 @@ def build_row(
         cust_ship_excl = cust_ship / (1 + SHIPPING_TAX_RATE / 100.0)
     elif temp:
         flags.append("消費者負担送料: 温度帯→常温/クール対応が取れず空欄")
+
+    # --- 送料差額（仕入送料 − 消費者送料、ともに税抜） ---
+    送料差額: Optional[float | int] = None
+    if inbound is not None and cust_ship_excl is not None:
+        送料差額 = round6(inbound - cust_ship_excl)
+        out["送料差額_税抜"] = 送料差額
+
+    # --- 価格決定 ---
+    # 送料赤字（仕入送料>消費者送料）: 上代を尊重し、送料赤字分だけ上乗せ（送料に乗せ率はかけない）。
+    # それ以外（送料黒字/差額不明）: 現行維持＝手入力の想定販売価格を採用。
+    manual_in = to_float(rec.get("想定販売価格_税込"))
+    method = ""
+    sale_in: Optional[float] = None
+    if 送料差額 is not None and 送料差額 > 0 and jodai_excl is not None and rate is not None:
+        rec_in = round_price(round6(jodai_excl + 送料差額) * (1 + rate / 100.0))
+        out["推奨販売価格_税込"] = rec_in
+        method = "差額ルール"
+        sale_in = rec_in
+    elif manual_in is not None:
+        method = "現行維持"
+        sale_in = manual_in
+    out["プライシング方式"] = method
+
+    sale_excl: Optional[float] = None
+    if sale_in is not None:
+        out["variant_price_税込"] = round6(sale_in)
+        out["想定販売価格_税込"] = round6(sale_in)
+        sale_excl = to_excl(sale_in, rate)
+        out["想定販売価格_税抜"] = round6(sale_excl) if sale_excl is not None else ""
+        # 決済手数料は販管費。粗利には含めず参考表示のみ。
+        out["決済手数料_販管費"] = round6(sale_in * fee_rate)
+    else:
+        flags.append("想定販売価格: 未確定（送料赤字は上代・送料／それ以外は手入力が必要）")
 
     # --- 採算（売上＝販売税抜＋消費者送料税抜 / 原価＝売上原価。決済手数料は粗利外） ---
     粗利: Optional[float | int] = None
@@ -422,9 +476,9 @@ def build_row(
                 out["粗利率"] = round6(粗利 / 売上)
             # 送料は行ってこい確認用（消費者送料 − 仕入送料、ともに税抜）
             out["送料PL_通常時"] = round6(cust_ship_excl - inbound)
-            if sale_in is not None and 粗利 is not None:
+            if 粗利 is not None:
                 out["手数料控除後利益_参考"] = round6(粗利 - sale_in * fee_rate)
-        out["採算フラグ"] = _profit_flags(out, 粗利, jodai_excl, sale_excl, sale_in, free_line)
+    out["採算フラグ"] = _profit_flags(out, 粗利, jodai_excl, sale_excl, sale_in, free_line, method)
 
     # --- tags（決定論的に組成。用途タグは手動） ---
     out["tags"] = _build_tags(temp, out["仕入先"], out["産地"])
@@ -439,15 +493,21 @@ def _profit_flags(
     sale_excl: Optional[float],
     sale_in: Optional[float],
     free_line: int,
+    method: str,
 ) -> str:
-    """採算フラグ文字列を組み立てる."""
+    """採算フラグ文字列を組み立てる.
+
+    差額ルールの上代超過は「送料赤字の転嫁」で設計通りのためフラグ対象外。
+    現行維持の価格のみ、許容率(JODAI_TOL)を超える上代超過をフラグする。
+    """
     af: list[str] = []
     if 粗利 is not None and 粗利 < 0:
         af.append("通常時粗利が赤字（逆ざや）")
     if out["粗利_送料無料時"] != "" and out["粗利_送料無料時"] < 0:
         af.append("送料無料時粗利が赤字")
-    if jodai_excl is not None and sale_excl is not None and sale_excl > jodai_excl:
-        af.append("想定販売価格が参考上代を上回る")
+    if (method != "差額ルール" and jodai_excl and sale_excl is not None
+            and sale_excl > jodai_excl * (1 + JODAI_TOL)):
+        af.append(f"想定販売価格が参考上代を+{(sale_excl / jodai_excl - 1) * 100:.0f}%上回る")
     if sale_in is not None and sale_in >= free_line:
         af.append(f"単品で送料無料ライン({free_line:,}円)到達。送料無料時粗利を確認")
     return " / ".join(af)
@@ -519,8 +579,8 @@ def _write_summary_sheet(ws: Worksheet, rows: list[dict[str, Any]], cfg: dict[st
         f"送料無料ライン: {cfg['送料無料ライン_税込']:,}円）"
     )
     ws["A1"].font = FONT_TITLE
-    cols = ["仕入先", "商品名_見積準拠", "温度帯", "想定販売価格_税込",
-            "売上_税抜", "売上原価_税抜", "粗利_税抜", "粗利率",
+    cols = ["仕入先", "商品名_見積準拠", "温度帯", "プライシング方式", "想定販売価格_税込",
+            "参考上代_税抜", "売上_税抜", "売上原価_税抜", "粗利_税抜", "粗利率",
             "粗利_送料無料時", "採算フラグ"]
     ws.append([])
     ws.append(cols)
