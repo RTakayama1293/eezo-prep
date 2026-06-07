@@ -365,6 +365,11 @@ def build_row(
     out["出典ファイル"] = rec.get("出典ファイル", "")
     out["supplier"] = rec.get("仕入先", "")
     out["supplier_product_name"] = rec.get("商品名_見積準拠", "")
+    # title は EEZO商品名（整えた登録名）。未設定なら見積名を仮採用（DRAFTで登録前に整える）
+    eezo_name = (rec.get("EEZO商品名") or "").strip()
+    out["title"] = eezo_name or rec.get("商品名_見積準拠", "")
+    out["productType"] = (rec.get("productType") or "").strip()
+    out["画像URL"] = (rec.get("画像URL") or "").strip()
     temp = (rec.get("温度帯") or "").strip()
     out["温度帯"] = temp
     if not temp:
